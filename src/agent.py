@@ -317,8 +317,12 @@ class ReviewAgent:
         #    write ONLY accepted recommendations to the board.
         recs = parse_recommendations(raw)
         accepted, rejected = validate_against_pack(recs, pack)
-        self.bb.trace("pack_validation", self.role, {
-            "accepted": len(accepted), "rejected": len(rejected),
+        # traced as tool_call (the backbone whitelist has no 'pack_validation'
+        # type — and shouldn't: this is an executed validation step, and the
+        # specifics belong in the payload, not in a new Tier-2 event type)
+        self.bb.trace("tool_call", self.role, {
+            "tool": "pack_validation", "accepted": len(accepted),
+            "rejected": len(rejected),
             "rejected_sources": [r.source[:120] for r in rejected],
         }, job_id=job_id)
         recs = accepted
