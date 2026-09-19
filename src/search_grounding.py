@@ -150,15 +150,17 @@ def _get_search_fn():
 def build_queries(spec_text: str) -> list:
     """Derive search queries from the locked job spec TEXT.
     Deterministic: same spec -> same queries -> comparable runs.
-    Extracts the topic phrase the v1 spec template uses; falls back to the
-    spec's first sentence if the phrasing changes."""
-    topics = re.findall(r"(self-improving agent[^.,;]*)", spec_text, flags=re.I)
-    base = topics[0].strip() if topics else spec_text.split(".")[0][:80]
+    v1.3.4: the v1.3.3 topic-regex greedily swallowed spec prose up to the
+    next comma ("...agent design and propose novel improvements (GUI" ->
+    junk queries -> GitHub 200-with-zero-items -> fail-closed abort).
+    Fix: extract ONLY the topical noun phrase, then use fixed templates."""
+    m = re.search(r"self-improving agents?", spec_text, flags=re.I)
+    base = m.group(0) if m else spec_text.split(".")[0][:60].strip()
     queries = [
-        f"{base} expert researcher",
-        f"{base} survey arxiv",
-        f"{base} open source github",   # repo hunting — run 1's blind spot
-        f"{base} tools framework",
+        f"{base} framework",
+        f"{base} survey",
+        f"{base} open source",       # repo hunting — run 1's blind spot
+        f"{base} tools",
     ]
     return queries[:MAX_QUERIES]
 
