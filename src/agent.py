@@ -8,6 +8,24 @@ Slice 2/3 — First agent role: Review (recommendation agent) + Mistral adapter.
   - Rubric scoring (novelty, relevance, evidence quality, actionability,
     vision alignment) scored by Paul/Vibe, 1-5 — stored when provided.
 
+v1.3 (19 Sept 2026): forced search grounding. Run 1 failed content
+validation (1 clean citation of 10) because the Review role had no real
+search tool — step 3 previously traced a DECORATIVE tool_call
+('seeded-corpus-v0') for a search that never executed, so all citations
+were model weights-recall. Changes in this version:
+  1. Recommendation gains a 'url' field.
+  2. Prompt now demands the evidence-pack URL as 'source'.
+  3. run() phase 1: harness-driven grounding (search_grounding.ground) —
+     the agent does NOT choose when to search (Paul's decision: keep the
+     design tight, no wandering this early). Fail-closed: no evidence,
+     no recommendations.
+  4. run() phase 2: only recommendations whose 'source' exactly matches a
+     pack URL reach the change board (parser-boundary enforcement).
+  5. __main__ block defaults to job-live-002 with the SAME spec text as
+     job-live-001 for the apples-to-apples trust-trend comparison.
+  KEDB addition: traced-but-unimplemented tool calls are a honesty failure
+  of the SYSTEM, not the model — only trace what actually executes.
+
 v1.2 (18 Sept 2026): second live-run failure — model invented the type
 'source_expert' despite the enum in the prompt. Lesson locked in: you cannot
 prompt your way to strict enums with a creative model; the PARSER is the
@@ -27,6 +45,11 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from backbone import Backbone
+from search_grounding import (
+    evidence_pack_prompt,
+    ground,
+    validate_against_pack,
+)
 
 # --------------------------------------------------------------------- config
 
@@ -34,23 +57,26 @@ ROLE_DEFINITIONS = {
     "review": {
         "prompt": (
             "You are the Review role of a self-improving agent system. "
-            "Your job: discover NEW experts and sources (not from a curated list) "
-            "and propose novel improvements to the system design (GUI, UX, context "
-            "recording, ontology, toolset). For every recommendation give: source, "
-            "type, evidence, predicted impact, and risk. Prioritise the list. "
+            "Your job: recommend experts and sources ONLY from the EVIDENCE "
+            "PACK provided (found by live web search — never from memory) "
+            "and propose novel improvements to the system design (GUI, UX, "
+            "context recording, ontology, toolset). For every recommendation "
+            "give: source (an exact URL from the evidence pack), type, "
+            "evidence, predicted impact, and risk. Prioritise the list. "
             "Do not modify anything directly — all changes go through the change board.\n\n"
             "IMPORTANT constraints:\n"
             "- 'type' must be exactly one of: research_paper, source_class, "
             "improvement_proposal\n"
             "- 'risk' must be exactly one word: low, medium, or high\n"
+            "- 'source' must be exactly one of the evidence-pack URLs\n"
             "- put any qualification in the evidence or impact fields\n\n"
             "Respond ONLY with valid JSON in this exact shape:\n"
-            '{"recommendations": [{"source": "...", "type": "research_paper|source_class|'
-            'improvement_proposal", "evidence": "...", "impact": "...", '
-            '"risk": "low|medium|high"}]}'
+            '{"recommendations": [{"source": "<exact evidence-pack URL>", "type": '
+            '"research_paper|source_class|improvement_proposal", "evidence": "...", '
+            '"impact": "...", "risk": "low|medium|high"}]}'
         ),
         "model": {"provider": "mistral", "model": "mistral-large-latest"},
-        "tools": ["search_sources", "read_source"],
+        "tools": ["search_sources", "read_source"],  # executed by the harness
     },
 }
 
@@ -119,34 +145,40 @@ class MistralClient:
 
 
 class MockModel:
-    """Deterministic stand-in when no API key is present. Same interface."""
+    """Deterministic stand-in when no API key is present. Same interface.
+    v1.3: recommendations now use pack-style URLs so the grounded pipeline
+    is exercised end-to-end in offline mode too."""
 
     def __init__(self, config: ModelConfig):
         self.config = config
 
     def complete(self, system_prompt: str, user_input: str) -> str:
+        # Extract a pack URL to cite so mock runs pass pack validation.
+        import re as _re
+        urls = _re.findall(r"  (https?://\S+)", system_prompt)
+        cite = urls[0] if urls else "https://arxiv.org/abs/2609.14858"
         return json.dumps({
             "recommendations": [
                 {
-                    "source": "arXiv:2609.14858 (Dream-RSI)",
+                    "source": cite,
                     "type": "research_paper",
                     "evidence": "Proposes scaffolded self-improvement with external validators",
                     "impact": "Cross-model validation design already borrowed; replay simulator could adopt its trajectory scoring",
                     "risk": "low",
                 },
                 {
-                    "source": "solo-dev ECC-adjacent repos (pattern: single-maintainer agent frameworks)",
+                    "source": "https://github.com/affaan-m/ECC",
                     "type": "source_class",
-                    "evidence": "Curated list missed the repo Paul found manually — class itself is the finding",
+                    "evidence": "Solo-maintainer agent framework — the curated list missed this repo class",
                     "impact": "Discovery tool should rank low-maintainer-count repos higher for novelty",
-                    "risk": "medium — novelty correlates with unvetted quality",
+                    "risk": "medium",
                 },
                 {
                     "source": "prop: context-recording ontology for role handoffs",
                     "type": "improvement_proposal",
                     "evidence": "Goal-drift guard stores the spec as state; handoff context is the next unrecorded channel",
                     "impact": "Makes drift measurable at every handoff, not just spec divergence",
-                    "risk": "medium — scope creep if ontology grows unbounded",
+                    "risk": "medium",
                 },
             ]
         })
@@ -198,7 +230,8 @@ class Recommendation:
     evidence: str
     impact: str
     risk: str
-    model_type: str = ""     # the type word the model actually used (pre-normalisation)
+    url: str = ""             # v1.3: pack URL (== source when grounded)
+    model_type: str = ""      # the type word the model actually used (pre-normalisation)
     scores: dict = field(default_factory=dict)  # rubric scores added later (1-5)
 
     @property
@@ -229,12 +262,14 @@ def parse_recommendations(raw: str) -> list[Recommendation]:
         if risk_key not in valid_risks:
             # risk words we can't read at all: keep the prose, grade as high risk
             risk_key = "high"
+        src = r["source"]
         recs.append(Recommendation(
-            source=r["source"],
+            source=src,
             type=canonical,
             evidence=r["evidence"],
             impact=r["impact"],
             risk=r["risk"],
+            url=src if src.startswith("http") else "",
             model_type=r.get("type", ""),
         ))
     return recs
@@ -262,26 +297,39 @@ class ReviewAgent:
             "spec_sha256_tail": hashlib.sha256(spec.encode()).hexdigest()[-12:],
         }, job_id=job_id)
 
-        # 3. Tool call traced (discovery tool; real search wiring is next slice).
-        self.bb.trace("tool_call", self.role, {
-            "tool": "search_sources", "args_digest": "seeded-corpus-v0",
-        }, job_id=job_id)
+        # 3. PHASE 1 — forced grounding (harness-driven; the agent does not
+        #    choose when to search). Fail-closed: raises before the model is
+        #    consulted if no evidence can be gathered. Only real executions
+        #    are traced — the v1 decorative 'seeded-corpus-v0' tool_call is
+        #    gone (KEDB: traced-but-unimplemented tool calls).
+        pack = ground(spec, self.bb, self.role, job_id)
 
-        # 4. Model response captured verbatim.
-        raw = self.model.complete(self.definition["prompt"], spec)
+        # 4. PHASE 2 — the model may only cite pack URLs. The evidence pack
+        #    is appended to the system prompt; the spec is unchanged.
+        prompt = self.definition["prompt"] + "\n\n" + evidence_pack_prompt(pack)
+        raw = self.model.complete(prompt, spec)
         self.bb.trace("model_response", self.role, {
-            "model": self.model.config.model, "mode": model_mode(), "response": raw,
+            "model": self.model.config.model, "mode": model_mode(),
+            "response": raw, "pack_size": len(pack),
         }, job_id=job_id)
 
-        # 5. Parse, prioritise, and write every recommendation to the board.
+        # 5. Parse, enforce pack membership at the boundary, prioritise, and
+        #    write ONLY accepted recommendations to the board.
         recs = parse_recommendations(raw)
+        accepted, rejected = validate_against_pack(recs, pack)
+        self.bb.trace("pack_validation", self.role, {
+            "accepted": len(accepted), "rejected": len(rejected),
+            "rejected_sources": [r.source[:120] for r in rejected],
+        }, job_id=job_id)
+        recs = accepted
         recs.sort(key=lambda r: r.priority, reverse=True)
         for r in recs:
             self.bb.propose_change(
                 job_id, self.role, "recommendation",
                 f"{r.type}: {r.source}",
                 {"source": r.source, "type": r.type, "model_type": r.model_type,
-                 "evidence": r.evidence, "impact": r.impact, "risk": r.risk},
+                 "evidence": r.evidence, "impact": r.impact, "risk": r.risk,
+                 "url": r.url},
             )
         return recs
 
@@ -305,12 +353,13 @@ class ReviewAgent:
 
 if __name__ == "__main__":
     # One-shot live run: python3 src/agent.py "optional job spec text"
+    # v1.3: defaults to job-live-002 with the SAME spec as job-live-001.
     import sys
     from pathlib import Path
 
     db = Path(__file__).resolve().parent.parent / "data" / "live.db"
     bb = Backbone(db)
-    job_id = "job-live-001"
+    job_id = "job-live-002"
     spec = sys.argv[1] if len(sys.argv) > 1 else (
         "Discover NEW experts/sources for self-improving agent design and propose "
         "novel improvements (GUI, UX, context recording, ontology, toolset). "
@@ -322,7 +371,8 @@ if __name__ == "__main__":
         pass  # already locked from a previous run
     agent = ReviewAgent(bb)
     print(f"model mode: {model_mode()}")
-    for r in agent.run(job_id):
+    recs = agent.run(job_id)
+    for r in recs:
         marker = "" if r.model_type == r.type else f"  (model said: {r.model_type})"
         print(f"[{r.priority:4.1f}] {r.type:22s} {r.source}{marker}")
         print(f"        evidence: {r.evidence[:100]}")
