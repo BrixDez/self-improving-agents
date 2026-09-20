@@ -56,11 +56,9 @@ Suggest one commit per meaningful change with a plain-English message. Explain a
 6. Precise-fabricated-figure signature
 7. Loose analogy presented as relevance
 
-## Current status pointers (update as work moves)
+## Status
 
-- Live run history: run 1 (ungrounded, 1/10 clean citations) → run 2 / job-live-002 (search-grounded, 10/10 real URLs)
-- Durable project state and decision log live outside this repo (Vibe Knowledge: project-state); this file covers repo conventions only
-- Backlog: evidence-pack caching/retry, arXiv via curl/requests, fake-search-asserts-query-shape test gap
+Durable project status, decisions, and run history live in the Vibe Knowledge topic `project-state` — not in this file. This file covers conventions only; do not let it drift into a status log.
 
 ---
 
