@@ -37,6 +37,11 @@ TRACE_EVENT_TYPES = (
     "spec_injection",     # goal-drift guard: spec re-injected at a handoff
     "test_run",           # a test executed against a change
     "signoff",            # tier decision recorded
+    # Pipeline event types (v1.4)
+    "pipeline_start",     # pipeline execution started
+    "pipeline_complete",  # pipeline finished all roles successfully
+    "pipeline_error",     # pipeline failed
+    "pipeline_step_complete",  # a pipeline step finished
 )
 
 SCHEMA = """

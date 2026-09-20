@@ -284,8 +284,10 @@ class ReviewAgent:
         self.definition = ROLE_DEFINITIONS[role]
         self.model = make_model(ModelConfig(**self.definition["model"]))
 
-    def run(self, job_id: str) -> list[Recommendation]:
+    def run(self, job_id: str, context=None) -> list[Recommendation]:
         # 1. Goal-drift guard: spec re-injected verbatim at handoff (traced).
+        #    Context parameter is for pipeline integration; ignored for Review role
+        #    (Review is always the first role and doesn't consume previous context).
         spec = self.bb.inject_spec(job_id, self.role)
 
         # 2. Role invocation traced with the spec digest (not full text — the
