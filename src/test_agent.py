@@ -211,10 +211,18 @@ class TestAgent:
         # First, try code changes
         if context.code_changes:
             for i, change in enumerate(context.code_changes):
+                # Handle both dict and CodeChange objects
+                if isinstance(change, dict):
+                    summary = change.get("summary", change.get("description", ""))
+                else:
+                    # CodeChange object
+                    summary = getattr(change, "summary", "") or \
+                             getattr(change, "proposal_summary", "") or \
+                             f"{change.change_type}: {change.file_path}"
                 targets.append({
                     "target_type": "code_change",
                     "target_id": f"code-{i}",
-                    "target_summary": change.get("summary", change.get("description", ""))[:100],
+                    "target_summary": str(summary)[:100],
                     "raw_obj": change,
                 })
         

@@ -156,7 +156,8 @@ class Pipeline:
         elif current_role == "signoff" and context.test_results:
             summary["test_results_count"] = len(context.test_results)
             summary["test_passed"] = sum(
-                1 for r in context.test_results if r.get("verdict") == "pass"
+                1 for r in context.test_results 
+                if getattr(r, "verdict", "") == "pass"
             )
         
         return summary
