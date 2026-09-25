@@ -286,8 +286,10 @@ class ReviewAgent:
 
     def run(self, job_id: str, context=None) -> list[Recommendation]:
         # 1. Goal-drift guard: spec re-injected verbatim at handoff (traced).
-        #    Context parameter is for pipeline integration; ignored for Review role
-        #    (Review is always the first role and doesn't consume previous context).
+        #    Context parameter is for pipeline integration: Review is the first
+        #    role and doesn't consume previous context, but it PUBLISHES the
+        #    grounded evidence pack on the context so the Test role can validate
+        #    proposal evidence URLs against it (fix-evidence-url-validation-001).
         spec = self.bb.inject_spec(job_id, self.role)
 
         # 2. Role invocation traced with the spec digest (not full text — the
@@ -305,6 +307,12 @@ class ReviewAgent:
         #    are traced — the v1 decorative 'seeded-corpus-v0' tool_call is
         #    gone (KEDB: traced-but-unimplemented tool calls).
         pack = ground(spec, self.bb, self.role, job_id)
+
+        # Publish the pack on the pipeline context (mutating in place: the
+        # pipeline deep-copies the context AFTER the role returns, so the
+        # pack survives the handoff). Direct calls without a context skip this.
+        if context is not None and hasattr(context, "evidence_pack"):
+            context.evidence_pack = dict(pack)
 
         # 4. PHASE 2 — the model may only cite pack URLs. The evidence pack
         #    is appended to the system prompt; the spec is unchanged.

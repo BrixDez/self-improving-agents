@@ -125,28 +125,42 @@ def create_valid_code_change(idx: int) -> CodeChange:
 # ============================================================ FLAW 1: Fabricated Evidence
 # A Proposal whose evidence field contains a URL not present in the evidence pack
 # This mimics KEDB #3: blended citation
+#
+# fix-evidence-url-validation-001: the Test role now validates proposal
+# source/evidence URLs against the job's evidence pack. The probe supplies
+# an explicit pack on the context so the FLAW is a fabricated URL (pack
+# member check), not a missing pack (which fails closed separately).
 
 FAW_1_NAME = "fabricated_evidence"
 FAW_1_DESCRIPTION = "Proposal with evidence URL not in evidence pack"
 
+# Pack for this probe: the proposal's source IS a member; only the evidence
+# URL is fabricated — isolating the flaw to the membership check.
+FAW_1_PACK = {
+    "https://example.com/real-source": "Real source used by the probe",
+}
+
 
 def t_flaw_1_fabricated_evidence():
     """Test that Test role flags a Proposal with fabricated evidence URL.
-    
+
     This is a direct Test-role invocation (bypassing Review/Plan) with a
-    Proposal that has an evidence field containing a URL that was never
-    in any evidence pack.
+    Proposal whose evidence field contains a URL that was never in the
+    evidence pack. The Test role MUST reject it (critical failure).
     """
     # Lock spec for this probe job
     probe_job_id = "probe-flaw-1"
-    bb.lock_job_spec(probe_job_id, SPEC)
-    
+    try:
+        bb.lock_job_spec(probe_job_id, SPEC)
+    except ValueError:
+        pass  # Already locked
+
     # Create a proposal with a fabricated evidence URL
     bad_proposal = Proposal(
         change_type="feature",
         summary="Bad proposal with fake evidence",
         description="This looks valid but has fake evidence",
-        source="https://example.com",
+        source="https://example.com/real-source",
         evidence="Evidence from https://fake-pack-url-that-was-never-in-pack.com/study",
         impact="Some impact",
         risk="medium",
@@ -154,46 +168,59 @@ def t_flaw_1_fabricated_evidence():
         priority=2.0,
         estimated_effort=3,
     )
-    
-    # Run Test role directly on this proposal
-    ctx = PipelineContext(job_id=probe_job_id, plan_proposals=[bad_proposal])
-    
+
+    # Run Test role directly on this proposal, with an explicit evidence pack
+    ctx = PipelineContext(job_id=probe_job_id, plan_proposals=[bad_proposal],
+                          evidence_pack=dict(FAW_1_PACK))
+
     try:
-        results = test_agent.run("probe-flaw-1", ctx)
-        
-        # The proposal itself should NOT cause a critical failure
-        # But we need to check: does the validation catch the fabricated evidence?
-        # Actually, the current Test role doesn't validate evidence URLs against a pack
-        # It only validates structure. So this flaw might NOT be caught.
-        # This is a gap in the current implementation!
-        
-        # Let's check what tests were run
-        for r in results:
-            print(f"    Test: {r.test_name}, Verdict: {r.verdict}, Detail: {r.detail}")
-        
-        # The fabricated evidence flaw is NOT currently detected by Test role
-        # This is a FINDING, not a failure of this test
-        # The test passes because it's testing current behavior
-        # But we should report this as a gap
-        
-        flaw_report[FAW_1_NAME] = {
-            "status": "NOT_DETECTED",
-            "details": "Test role does not validate evidence URLs against evidence pack",
-            "change_ids": [r.change_id for r in results if r.change_id],
-            "tests": [(r.test_name, r.verdict, r.detail) for r in results],
-        }
-        
-        # This is NOT a test failure - it's documenting current behavior
-        # The actual flaw is that the validation doesn't exist yet
-        
-    except RuntimeError as e:
-        # If the pipeline aborted, that's actually good - but unlikely here
+        results = test_agent.run(probe_job_id, ctx)
+
+        # If the run did NOT abort, the fabricated-URL test must have failed.
+        # (validate_evidence_urls is priority 4 -> critical, so an abort is
+        # the expected path; reaching here means something is off.)
+        detected = [r for r in results
+                     if r.test_name == "validate_evidence_urls" and r.verdict == "fail"]
+
+        if not detected:
+            flaw_report[FAW_1_NAME] = {
+                "status": "PASSED_THROUGH",
+                "details": "Fabricated evidence URL was NOT rejected by any test",
+                "change_ids": [r.change_id for r in results if r.change_id],
+                "tests": [(r.test_name, r.verdict, r.detail) for r in results],
+            }
+            raise AssertionError(
+                f"FLAW PASSED THROUGH: {FAW_1_NAME} - fabricated evidence URL "
+                f"was not detected. Test results: "
+                f"{[(r.test_name, r.verdict) for r in results]}"
+            )
+
         flaw_report[FAW_1_NAME] = {
             "status": "REJECTED",
-            "details": f"Pipeline aborted: {e}",
+            "details": f"Caught by validate_evidence_urls ({len(detected)} result(s))",
+            "change_ids": [r.change_id for r in results if r.change_id],
+            "failed_tests": [(r.test_name, r.verdict, r.detail, r.priority) for r in detected],
+        }
+
+    except RuntimeError as e:
+        # Pipeline aborted on a critical failure — verify it was the
+        # evidence-URL validation that caught the flaw, not something else.
+        if "validate_evidence_urls" not in str(e) and "evidence" not in str(e).lower():
+            flaw_report[FAW_1_NAME] = {
+                "status": "PASSED_THROUGH",
+                "details": f"Aborted for the wrong reason: {e}",
+                "change_ids": [],
+            }
+            raise AssertionError(
+                f"FLAW PASSED THROUGH: {FAW_1_NAME} - pipeline aborted but not "
+                f"because of evidence validation: {e}"
+            )
+        flaw_report[FAW_1_NAME] = {
+            "status": "REJECTED",
+            "details": f"Pipeline aborted on critical evidence failure: {e}",
             "change_ids": [],
         }
-    
+
     # Clean up test db entries for this probe
     bb.conn.execute("DELETE FROM test_runs WHERE change_id IN (SELECT change_id FROM changes WHERE job_id='probe-flaw-1')")
     bb.conn.execute("DELETE FROM changes WHERE job_id='probe-flaw-1'")
@@ -212,7 +239,10 @@ def t_flaw_2_empty_payload():
     """Test that Test role flags a CodeChange with empty content."""
     # Lock spec for this probe job
     probe_job_id = "probe-flaw-2"
-    bb.lock_job_spec(probe_job_id, SPEC)
+    try:
+        bb.lock_job_spec(probe_job_id, SPEC)
+    except ValueError:
+        pass  # Already locked (probe db persists between runs)
     
     # Create a code change with empty content
     bad_change = CodeChange(
@@ -296,7 +326,10 @@ def t_flaw_3_secret_leak():
     
     # Lock spec for this probe job
     probe_job_id = "probe-flaw-3"
-    bb.lock_job_spec(probe_job_id, SPEC)
+    try:
+        bb.lock_job_spec(probe_job_id, SPEC)
+    except ValueError:
+        pass  # Already locked (probe db persists between runs)
     
     # Run Test role directly on this code change
     ctx = PipelineContext(job_id=probe_job_id, code_changes=[bad_change])
@@ -358,12 +391,19 @@ def t_flaw_circularity_check():
     which prevents Sign off from running. This is fail-closed behavior.
     
     We plant 3 flawed proposals alongside 20 valid ones:
-    - Fabricated evidence: NOT detected (gap in validation)
+    - Fabricated evidence: Detected by validate_evidence_urls (priority 4, critical)
     - Empty description: Detected (priority 2, non-critical)
     - Secret leak: Detected (priority 5, critical) -> causes Test role abort
     """
     # Create 20 valid proposals
     valid_proposals = [create_valid_proposal(i) for i in range(20)]
+
+    # Evidence pack covering every valid proposal's source URL, so the only
+    # evidence-URL failures are the planted flaws
+    circ_pack = {
+        f"https://example.com/valid-{i}": f"Valid source {i}"
+        for i in range(20)
+    }
     
     # Create 3 flawed proposals
     # Flaw 1: Fabricated evidence (not currently detected by validation)
@@ -414,10 +454,14 @@ def t_flaw_circularity_check():
     
     # Lock spec for this probe job
     probe_job_id = "probe-flaw-circularity"
-    bb.lock_job_spec(probe_job_id, SPEC)
+    try:
+        bb.lock_job_spec(probe_job_id, SPEC)
+    except ValueError:
+        pass  # Already locked (probe db persists between runs)
     
     # Run Test role on all 23 proposals
-    ctx = PipelineContext(job_id=probe_job_id, plan_proposals=all_proposals)
+    ctx = PipelineContext(job_id=probe_job_id, plan_proposals=all_proposals,
+                          evidence_pack=circ_pack)
     
     try:
         results = test_agent.run(probe_job_id, ctx)
@@ -592,10 +636,10 @@ for test_file in existing_tests:
     print(f"Running {test_file}...")
     result = subprocess.run(
         ["python", test_file],
-        cwd="/C/Mistral/self-improving-agents",
+        cwd=str(Path(__file__).resolve().parent.parent),  # repo root (Windows-safe)
         capture_output=True,
         text=True,
-        timeout=60
+        timeout=120
     )
     if result.returncode != 0:
         print(f"  FAILED: {test_file}")

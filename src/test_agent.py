@@ -20,11 +20,15 @@ KEDB considerations:
   - Model may fabricate test results -> constrain at parser boundary
   - Test re-roll trap: never re-run same test on same change
   - Empty input -> fail-closed (no tests to run)
+  - Fabricated evidence URLs (KEDB #3): proposal source/evidence URLs
+    must be members of the job's evidence pack; no resolvable pack with
+    proposals present -> fail-closed (fix-evidence-url-validation-001)
   - Test never edits what it tests (AGENTS.md rule #5)
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -35,6 +39,11 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------- constants
+
+# Parser boundary for URL extraction (fix-evidence-url-validation-001):
+# matches http(s) URLs embedded in free text; trailing sentence punctuation
+# is stripped after extraction.
+URL_PATTERN = re.compile(r"https?://[^\s<>\"'\)\]]+")
 
 # Valid test verdicts
 VERDICTS = ("pass", "fail", "hold")
@@ -140,6 +149,24 @@ class TestAgent:
                 "detail": "no code changes or proposals to test — aborting",
             }, job_id=job_id)
             raise RuntimeError("Test role: no code changes or proposals to test")
+
+        # 3b. Evidence pack: proposals must be validated against the job's
+        #     evidence pack (fix-evidence-url-validation-001). A job with
+        #     proposals but no resolvable pack fails closed — evidence URL
+        #     validation cannot be skipped.
+        evidence_pack: dict = {}
+        if any(t["target_type"] == "proposal" for t in targets):
+            evidence_pack = self._resolve_evidence_pack(job_id, context)
+            if not evidence_pack:
+                self.bb.trace("tool_call", self.role, {
+                    "tool": "evidence_pack_validation",
+                    "status": "missing_pack_abort",
+                    "detail": "job has proposals but no evidence pack — aborting",
+                }, job_id=job_id)
+                raise RuntimeError(
+                    "Test role: no evidence pack for job with proposals — "
+                    "cannot validate evidence URLs (fail closed)"
+                )
         
         # 4. Trace the test invocation
         self.bb.trace("role_invoke", self.role, {
@@ -151,7 +178,7 @@ class TestAgent:
         # 5. Validate each target
         results: list[TestResult] = []
         for target in targets:
-            target_results = self._validate_target(target, job_id)
+            target_results = self._validate_target(target, job_id, evidence_pack)
             results.extend(target_results)
             
             # Trace each validation
@@ -174,7 +201,8 @@ class TestAgent:
             }, job_id=job_id)
             raise RuntimeError(
                 f"Test role: {len(critical_failures)} critical test(s) failed; "
-                f"aborting pipeline"
+                f"aborting pipeline: "
+                + ", ".join(r.test_name for r in critical_failures[:3])
             )
         
         # 7. Write all test results to the change board
@@ -243,9 +271,10 @@ class TestAgent:
         
         return targets
 
-    def _validate_target(self, target: dict, job_id: str) -> list[TestResult]:
+    def _validate_target(self, target: dict, job_id: str,
+                         evidence_pack: dict | None = None) -> list[TestResult]:
         """Run validation tests against a single target.
-        
+
         Generates deterministic test results based on the target's properties.
         """
         results = []
@@ -253,18 +282,24 @@ class TestAgent:
         target_id = target["target_id"]
         target_summary = target["target_summary"]
         raw_obj = target["raw_obj"]
-        
+
         # Extract fields based on target type
         if target_type == "proposal":
             # For proposals, validate structure and content
             change_type = ""
             description = ""
+            source = ""
+            evidence = ""
             if isinstance(raw_obj, dict):
                 change_type = raw_obj.get("change_type", "")
                 description = raw_obj.get("description", "")
+                source = raw_obj.get("source", "")
+                evidence = raw_obj.get("evidence", "")
             else:
                 change_type = getattr(raw_obj, "change_type", "")
                 description = getattr(raw_obj, "description", "")
+                source = getattr(raw_obj, "source", "") or ""
+                evidence = getattr(raw_obj, "evidence", "") or ""
             
             # Test 1: Proposal has valid change_type
             results.append(self._run_test(
@@ -314,6 +349,19 @@ class TestAgent:
                 target_id=target_id,
                 target_summary=target_summary,
                 test_fn=lambda: self._validate_priority(priority),
+            ))
+
+            # Test 5: Every URL cited in source/evidence is a member of the
+            # job's evidence pack (fix-evidence-url-validation-001). Category
+            # 'regression' -> priority 4 -> critical: a fabricated URL aborts.
+            results.append(self._run_test(
+                test_name="validate_evidence_urls",
+                category="regression",
+                target_type=target_type,
+                target_id=target_id,
+                target_summary=target_summary,
+                test_fn=lambda: self._validate_evidence_urls(
+                    source, evidence, evidence_pack or {}),
             ))
             
         # Always check for secrets regardless of target type
@@ -404,6 +452,56 @@ class TestAgent:
         if isinstance(priority, (int, float)) and -5 <= priority <= 10:
             return True, f"Priority {priority} is within valid range"
         return False, f"Priority {priority} is out of expected range (-5 to 10)"
+
+    def _resolve_evidence_pack(self, job_id: str, context) -> dict:
+        """Resolve the job's evidence pack for proposal validation.
+
+        Order of resolution (fix-evidence-url-validation-001):
+        1. The pack published on the pipeline context by the Review role
+           (the true pack, set during grounding).
+        2. The job's accepted recommendations on the change board — their
+           source URLs are pack members by parser-boundary enforcement, so
+           they reconstruct the pack for direct (non-pipeline) invocations.
+        3. Empty -> the caller fails closed.
+        """
+        pack = getattr(context, "evidence_pack", None) or {}
+        if pack:
+            return pack
+
+        import json
+        pack = {}
+        for row in self.bb.conn.execute(
+            "SELECT payload FROM changes "
+            "WHERE job_id=? AND change_type='recommendation'",
+            (job_id,),
+        ):
+            try:
+                payload = json.loads(row["payload"])
+            except (ValueError, TypeError):
+                continue
+            for key in ("url", "source"):
+                value = payload.get(key, "")
+                if isinstance(value, str) and value.startswith("http"):
+                    pack.setdefault(value, payload.get("type", ""))
+        return pack
+
+    def _extract_urls(self, text) -> list[str]:
+        """Extract http(s) URLs from a field's text (parser boundary)."""
+        if not isinstance(text, str):
+            return []
+        return [u.rstrip(".,;:!?") for u in URL_PATTERN.findall(text)]
+
+    def _validate_evidence_urls(self, source, evidence, pack) -> tuple[bool, str]:
+        """Every URL cited in a proposal's source/evidence must be a member
+        of the job's evidence pack. A URL outside the pack is a fabricated
+        or blended citation (KEDB #3) — fail closed."""
+        urls = self._extract_urls(source) + self._extract_urls(evidence)
+        if not urls:
+            return True, "No URLs cited in source/evidence"
+        fabricated = sorted({u for u in urls if u not in pack})
+        if fabricated:
+            return False, f"URL(s) not in evidence pack: {fabricated[:3]}"
+        return True, f"All {len(set(urls))} cited URL(s) are evidence-pack members"
 
     def _validate_no_secrets(self, obj) -> tuple[bool, str]:
         """Validate that no secrets are present in the object."""

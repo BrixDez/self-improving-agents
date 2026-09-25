@@ -44,6 +44,9 @@ class PipelineContext:
     code_changes: list = field(default_factory=list)
     # Test -> Sign off
     test_results: list = field(default_factory=list)
+    # Evidence pack (url -> title) grounded by Review, carried to Test
+    # for evidence-URL validation (fix-evidence-url-validation-001)
+    evidence_pack: dict = field(default_factory=dict)
     # Error tracking
     errors: list = field(default_factory=list)
 

@@ -243,6 +243,70 @@ def t_validate_no_secrets():
     assert "No secrets" in detail
 
 
+# ============================================================ evidence URL validation
+# fix-evidence-url-validation-001
+
+def t_extract_urls():
+    """URL extraction finds http(s) URLs and strips trailing punctuation."""
+    urls = test_agent._extract_urls(
+        "See https://example.com/a, and https://example.com/b.")
+    assert urls == ["https://example.com/a", "https://example.com/b"], urls
+    assert test_agent._extract_urls("no urls here") == []
+    assert test_agent._extract_urls(None) == []
+    assert test_agent._extract_urls(12345) == []
+
+
+def t_validate_evidence_urls():
+    """Evidence URLs: pack members pass, fabricated URLs fail, no URLs pass."""
+    pack = {"https://example.com/pack-source": "Pack source title"}
+
+    # Cited URL is a pack member -> pass
+    success, detail = test_agent._validate_evidence_urls(
+        "https://example.com/pack-source",
+        "Grounded in https://example.com/pack-source", pack)
+    assert success is True, detail
+
+    # Cited URL is NOT a pack member -> fail (KEDB #3: blended citation)
+    success, detail = test_agent._validate_evidence_urls(
+        "https://example.com/pack-source",
+        "Evidence from https://fake-url-never-in-pack.com/study", pack)
+    assert success is False, detail
+    assert "not in evidence pack" in detail, detail
+
+    # No URLs cited -> nothing to validate -> pass
+    success, detail = test_agent._validate_evidence_urls(
+        "", "plain prose evidence, no URL", pack)
+    assert success is True, detail
+
+
+def t_test_fails_closed_on_missing_pack():
+    """Test agent fails closed when proposals exist but no evidence pack."""
+    job_id = "test-missing-pack-001"
+    bb.lock_job_spec(job_id, SPEC)
+
+    proposal = Proposal(
+        change_type="feature",
+        summary="Proposal with no evidence pack",
+        description="A structurally valid proposal",
+        source="https://example.com/somewhere",
+        evidence="Evidence text without any resolvable pack",
+        impact="Some impact",
+        risk="low",
+        recommendation_type="improvement_proposal",
+        priority=3.0,
+        estimated_effort=5,
+    )
+
+    # No evidence_pack on the context and no board recommendations for
+    # this job -> the Test role must abort, not skip the validation.
+    ctx = PipelineContext(job_id=job_id, plan_proposals=[proposal])
+    try:
+        test_agent.run(job_id, ctx)
+        raise AssertionError("expected fail-closed abort on missing evidence pack")
+    except RuntimeError as e:
+        assert "no evidence pack" in str(e).lower(), str(e)
+
+
 # ============================================================ full test run
 
 def t_test_consumes_proposals():
@@ -349,11 +413,14 @@ def t_pipeline_review_to_test():
     bb.lock_job_spec("pipeline-test-001", SPEC)
     
     result = pipeline.run("pipeline-test-001", SPEC, start_role="review")
-    
+
     assert result.success is True
     assert "review" in result.completed_roles
     assert "plan" in result.completed_roles
     assert "test" in result.completed_roles
+    # Review publishes the grounded evidence pack on the context, and it
+    # survives the handoffs to Test (fix-evidence-url-validation-001)
+    assert result.context.evidence_pack, "pipeline context should carry the evidence pack"
 
 
 def t_pipeline_test_traces_all_steps():
@@ -443,6 +510,8 @@ for name, fn in [
     ("validate_effort", t_validate_effort),
     ("validate_priority", t_validate_priority),
     ("validate_no_secrets", t_validate_no_secrets),
+    ("extract_urls from text", t_extract_urls),
+    ("validate_evidence_urls", t_validate_evidence_urls),
     
     # Full test run
     ("Test consumes proposals from context", t_test_consumes_proposals),
@@ -458,6 +527,7 @@ for name, fn in [
     
     # Fail-closed behavior
     ("Test fails on critical validation failure", t_test_fails_on_critical_failure),
+    ("Test fails closed on missing evidence pack", t_test_fails_closed_on_missing_pack),
     
     # Chain integrity
     ("hash chain intact after test", t_chain_intact_after_test_run),
